@@ -1,0 +1,110 @@
+-- Created by Lijian.
+-- User: Lijian <lijian@demo.com.cn>
+-- Date: 2019/8/23
+-- Desc: Cocurrent plugin 
+--
+
+local ngx   = ngx
+local kong  = kong
+local cjson = require "cjson"
+local redis = require "kong.plugins.openapi-cocurrent.iredis"
+local openapi_conf = require "kong.openapi.Config"
+local cache_key   = require "kong.plugins.proxy-cache.cache_key"
+local plugin_iter = require "kong.runloop.plugins_iterator"
+
+local get_method       = ngx.req.get_method
+local ngx_get_uri_args = ngx.req.get_uri_args
+local ngx_get_headers  = ngx.req.get_headers
+local ngx_re_sub       = ngx.re.gsub
+
+local CocurrentHandler = {}
+
+CocurrentHandler.PRIORITY = 555
+CocurrentHandler.VERSION = "2.0.0"
+
+-- get client ip
+local function get_client_ip()
+    local ip_ = ngx.req.get_headers()["X-Real-IP"]
+    if ip_ == nil then
+        ip_ = ngx.req.get_headers()["X-Forwarded-For"]
+        if ip_ then
+            local pos = string.find(ip_, ' ')
+            if pos then
+                client_ip = string.sub(ip_, 1, pos - 1)
+            end
+        end
+    end
+    if ip_ == nil then
+        ip_ = ngx.var.remote_addr
+    end
+    return ip_
+end
+
+local function get_cache_key()
+    local ctx = ngx.ctx
+    local consumer_id = ctx.authenticated_consumer and ctx.authenticated_consumer.id
+    local api_id = ctx.api and ctx.api.id
+    local route_id = ctx.route and ctx.route.id
+
+    local tmp_conf = {}
+    local cache_key = cache_key.build_cache_key(consumer_id, api_id, route_id,
+      get_method(),
+      ngx_re_sub(ngx.var.request, "\\?.*", "", "oj"),
+      ngx_get_uri_args(),
+      ngx_get_headers(100),
+      tmp_conf)
+    return cache_key
+end
+
+-- plugin access filter
+function CocurrentHandler:access(conf)
+    -- local c = cjson.encode(conf)
+    -- kong.log.err(c)
+    -- local route = ngx.ctx.route
+    -- kong.log.err(cjson.encode(route))
+
+    local current = conf.concurrency
+    if current > 0 then
+        local strategy = conf.strategy -- 1:504 2:cache 3:bottom 4:cache->bottom
+        local client_ip = get_client_ip()
+        local incr_key = "user:"..client_ip..":freq"
+        local block_key = "user:"..client_ip..":block"
+        -- kong.log.err(client_ip)
+        -- kong.log.err(incr_key)
+        -- kong.log.err(block_key)
+
+        local opts = { timeout = openapi_conf.redis_timeout, db_index = openapi_conf.redis_database }
+        local red = redis:new(opts)
+        local is_block, err = red:get(block_key) 
+        if tonumber(is_block) == 1 then
+            if strategy == 1 then
+                ngx.say("504")
+                ngx.exit(504)
+            else
+                local cache_key = get_cache_key()
+                kong.log.err(cache_key)
+                -- return bottom
+                local bottom = conf.bottomJson
+                if bottom ~= nil and bottom ~= "" then
+                    kong.response.set_header("Cocurrent", "True")
+                    kong.response.set_header("Ccurrent-Concurrency", current)
+                    kong.response.set_header("Cocurrent-Strategy", "Bottom-Data")
+                    ngx.say(bottom)
+                    ngx.exit(200)
+                end
+            end
+        end
+
+        local inc  = red:incr(incr_key)
+        if inc < current then
+            inc = red:expire(incr_key,1)
+        end
+
+        if inc > current then
+             red:set(block_key,1) 
+             red:expire(block_key,1)
+        end   
+    end
+end
+
+return CocurrentHandler
